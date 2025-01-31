@@ -1,0 +1,1082 @@
+---
+title: "Experiments on Using LLMs for Toponym Resolution"
+author: "Simona Bisiani"
+format: html
+editor: visual
+render: false
+execute:
+  eval: false
+editor_options: 
+  chunk_output_type: inline
+---
+
+In this document, we define a procedure leveraging llms to annotate data for the task of toponym resolution in UK local media.
+
+The procedure involves testing various models, prompts, and approaches, on a manually annotated gold standard dataset of 193 articles, selected through a combination of random selection (50% of the data) and stratified sampling (50%). The data is sourced from UKTwitNewsCor, a dataset of 2.6 million articles from a wide range of commercial and independent local media outlets in the UK, for the period 2020-2022.
+
+The problem is as follows: *given a toponym and a set of possible geographic candidates, which is the true candidate?*
+
+In local media research the main focal point of spatial research is often the administrative unit where a news outlet operates. This is reflected in studies which, to collect data about a certain place, use as input in archives such as LexisNexis or Retriever the name of a particular municipality/district. Other approaches involve collecting a pool of data, extract toponyms, and generate statistics about local news provision at the administrative level. In the UK, such administrative level corresponds to Local Authority Districts, of which there are around 361 in the country as of 2024. Studies like Bisiani and Heravi (2024), Ramsay and Moore (2014), PLUM Consulting (2020) all measured news provision (although not by content, but by number of outlets) by aggregating the number of providers dedicated to different districts.
+
+**Our task is to develop an approach to measure news provision in the UK not by presence, but rather through the places mentioned in texts**. There are several reasons for this, which namely boil down to a loss of local relevance perceived to have occurred in contemporary digital and print local media.
+
+We test several approaches: 1. Toponym Disambiguation from Knowledge Base: we treat the LLM as an annotator, and provide it with the same annotation guidelines as we gave the two annotators who worked on this task on the gold dataset. The guidelines contain a one-shot example of the task and data, and Chain of Thought (CoT) to facilitate reasoning. The model is presented with an entity, the article it is sourced from, metadata about the news outlet, and a list of options from which to select the correct answer.
+
+2.  Zero-shot Local Authority District linker: as most spatial research of local media is interested in local media provision and performance at the Local Authority District level, we test a second approach in which we simply ask the model, without any options provided, to identify the Local Authority District in which the entity is situated.
+
+------------------------------------------------------------------------
+
+**Background Information**
+
+-   **Entities -** Toponyms were extracted using SpaCy's transformer model en_core_web_trf for Named Entity Recognition (NER). The entities correspond to anything labelled as FAC, LOC, or GPE. SpaCy's en_core_web_trf was benchmarked against a manual annotation of the randomly selected portion of this dataset, returning 0.96 in Precision and 0.95 in F1-Score (this procedure is tested in the script "Validation.ipynb").
+
+-   **Candidates -** The list of options was generated through Named Entity Linking (NEL). A Knowledge Base was built by combining Ordnance Survey's \[Open Names\](<https://www.ordnancesurvey.co.uk/products/os-open-names>) dataset of place names, roads numbers and postcodes for Great Britain, and OpenStreetMap's \[Nominatim API\](<https://nominatim.org/release-docs/develop/api/Overview/>) limited to the GB country code. We define the options to supply the model in terms of the Local Authority District of the candidates returned by the KB.
+
+The workflow is as follow: article -\> *spaCy NER* -\> toponym -\> *query OSM and OS* -\> list of candidates with coordinates -\> *spatial query to identify Local Authority District of coordinates* -\> list of districts for toponym -\> *supply LLM district options to link to toponym given article context and metadata* -\> link back chosen district with coordinate database and assign to entity.
+
+## Setup and Data
+
+We leverage open-source, locally run models using the Ollama framework. Using a seed for our model interaction, alongside temperature parametrisation, we are able to generate reproducible results.
+
+```{r version}
+print(version)
+suppressPackageStartupMessages({
+# Load necessary libraries
+library(tidyverse)
+library(googlesheets4)
+library(tictoc)
+library(dplyr)
+library(purrr)
+library(jsonlite)
+library(httr2)
+library(glue)
+})
+```
+
+```{r data}
+#############################################################################
+# random sample
+annotations =
+  read_csv('../temp/NED_annotations/annotators_disambiguated_data.csv')
+
+annotations_further_data <- read_csv("../temp/NED_annotations/annotators_data.csv") |> filter(!is.na(LAD24NM)) |> group_by(doc, machine_entities_array) |>
+  mutate(full_option = paste0(
+    if_else(!is.na(machine_entities_array), machine_entities_array, ""),
+    if_else(!is.na(LAD24NM), paste0(", ", LAD24NM), ""),
+    if_else(!is.na(POSTCODE_DISTRICT), paste0(", ", POSTCODE_DISTRICT), ""),
+    if_else(
+      !is.na(Latitude) &
+        !is.na(Longitude),
+      paste0(", (", Latitude, ", ", Longitude, ")"),
+      ""
+    )
+  )) |>
+  select(doc, machine_entities_array, full_option)
+
+annotations_options =
+  fromJSON("../temp/NED_annotations/updated_merged_data.json") |>
+  as.data.frame() |>
+  unnest() |>
+  select(-domain) |>
+  left_join(
+    annotations,
+    by = c("doc", "machine_entities_array", "main_LAD"),
+    suffix = c("_docs", "_labelstudio")
+  ) |>
+  left_join(annotations_further_data,
+            by = c("machine_entities_array", "doc")) |>
+  group_by(id_docs) |>
+  mutate(options_str = if_else(any(!is.na(full_option)), paste(na.omit(full_option), collapse = "; "), "")#,
+         # options_with_coordinates = paste0(
+         #   options_str,
+         #   if_else(options_str != "", "; ", ""),
+         #   "True location not in options; Entity is not a location; Entity is a location outside the UK; Entity spans across several districts (e.g., a region); Unsure")
+         ) |>
+         ungroup() |>
+           select(-...1) |>
+           mutate(
+             # Prepare the options column with cleaned candidate options
+             options_str = map_chr(options, ~ paste(.x[.x != "Not linked to anything"], collapse = "; ")),
+             # Clean the options and create entity-candidate pairs
+             options_clean = str_sub(trimws(str_remove(
+               options_str, "LAD not in.*"
+             )), end = -2),
+             entity_candidate_pair = paste0(machine_entities_array, " [", options_clean, "]")
+           ) |>
+           group_by(doc) |>
+           mutate(other_entities_and_candidates = sapply(machine_entities_array, function(e) {
+             paste(setdiff(entity_candidate_pair, entity_candidate_pair[machine_entities_array == e]),
+                   collapse = "; ")
+           })) |>
+           ungroup()
+         
+
+# after creating the manual dataset, I had gone and removed some noise entities from the toponym candidates (these included Irish entities, names of foreign cities, Irish regions, country names)
+# all_possible_candidates <- read_csv("../temp/toponym_candidates_with_lads.csv")
+to_remove <- read_csv("../temp/entities_to_remove.csv")
+annotators_data_no_org <- read_csv("../temp/NED_annotations/annotators_data_no_org.csv") |> pull(machine_entities_array) |> unique()
+
+data <- annotations_options |> select(-full_option) |> distinct() |>
+  mutate(entity = str_to_lower(machine_entities_array)) |>
+  filter(!entity %in% to_remove$value) |>
+  filter(machine_entities_array %in% annotators_data_no_org) |>
+  rename(`Outlet coverage LAD` = main_LAD)
+
+# remove from environment unneded data
+rm(annotations, annotations_options, to_remove, annotations_further_data)
+
+#############################################################################
+# stratified sample
+second_batch <-
+  read_csv("Additional Data to Disambiguate.csv") |>
+  mutate(
+    annotators_choice = if_else(
+      Agreement == FALSE,
+      `Disagreement Review`,
+      `Annotator 1 Selection`
+    ),
+    options_str = paste0(
+      options,
+      "; LAD not in options; Entity is not a location; Entity is a location outside the UK; Entity spans across several districts (e.g., a region); Unsure"
+    )
+  ) |>
+  select(group_id, annotators_choice, options_str, entity)
+
+metadata_second_batch <- read_csv("../new_100_article_sample_w_candidates_for_google.csv") |>
+  left_join(second_batch, by = c("group_id", "entity")) |>
+  rename(machine_entities_array = entity,
+         `Outlet coverage LAD` = main_LAD) |> select(-options) |> 
+  group_by(group_id) |>
+  mutate(entity_candidate_pair = paste0(str_remove(paste0(machine_entities_array, " [", options_str), "; LAD not in.*"), "]"),
+    other_entities_and_candidates = sapply(machine_entities_array, function(e) {
+    paste(setdiff(entity_candidate_pair, entity_candidate_pair[machine_entities_array == e]),
+          collapse = "; ")
+  }))
+
+#############################################################################
+# merge the two datasets
+common_cols <- intersect(names(data), names(metadata_second_batch))
+llm_data <- purrr::map_df(list(data, metadata_second_batch), `[`, common_cols) |> 
+  mutate(annotators_choice = if_else(annotators_choice == "Armagh City", "Armagh City, Banbridge and Craigavon", annotators_choice))
+
+# Define models and temperatures to test
+models <- c("mistral", "gemma2:latest", "llama3.1:latest")
+temperatures <- seq(0, 1, by = 0.25)
+argList <- list(model = models, temperature = temperatures)
+crossArg <- cross_df(argList)
+data_expanded <- full_join(crossArg, llm_data, by = character())
+
+# remove from environment unneded data
+rm(argList, crossArg, data, metadata_second_batch, second_batch)
+```
+
+## Prompt Engineering
+
+In this section, we outline the high-level structure for a series of experiments aimed at determining the most effective prompt configuration for classifying toponyms based on context in articles. The experiments will evaluate how varying elements of the prompt influence the model's performance.
+
+```{r experiments_setup}
+# Define experiments: which fields to include
+experiments <- list(
+  exp1 = c("Outlet coverage LAD", "Domain", "Other Entities"),
+  exp2 = c("Domain", "Other Entities"),  # Mask Outlet coverage LAD
+  exp3 = c("Outlet coverage LAD", "Other Entities"),  # Mask Domain
+  exp4 = c("Domain")  # Only Domain (use this on its own and for few shot)
+)
+
+# Define prompt types
+prompts <- list(
+  concise = "Map the entity (a toponym) to the correct Local Authority District (LAD) from the options. Instructions:
+1. Review Entity and Article context.
+2. Check Metadata where provided:
+- Outlet coverage LAD, Domain, and other Entities and candidates (for hints on location).
+3. Choose the best option:
+- Select a LAD from the list provided, or choose from “LAD not in options,” “Entity is not a location,” “Entity is outside the UK,” “Entity spans multiple districts,” or “Unsure.”
+Format response as JSON: { 'chosen_option': 'Your choice', 'reasoning': 'Your reasoning' }",
+  
+  full = "The task is mapping an entity (a toponym) to the Local Authority District (LAD) in which it is situated. Your goal is to select the correct option from the list provided. Instructions:
+1. Review Entity and Article:
+- Identify the toponym (location name).
+- Read the article carefully to understand the context.
+Example:
+Entity: King's Head pub.
+Article: Incident outside the King's Head pub on Main Street, Guildford.
+Use surrounding text to infer the location (e.g., Guildford).
+
+2. Check Metadata where provided:
+- Domain: The publisher’s domain may provide geographic context.
+- Outlet coverage LAD: The Local Authority District covered by the outlet which published the article.
+- Other Entities: Other entities present in the same articles and their candidates.
+
+3. Select answer from options:
+Choose the correct answer from the options based on context.
+Options:
+- A list of applicable Districts, if any.
+- “LAD not in options” (choose if correct District is missing).
+- “Entity is not a location” if applicable.
+- “Entity is outside the UK” for non-UK locations.
+- “Entity spans across several districts (e.g., a region)“ for entities that are not specific to a single LAD (e.g., Wales, Sussex).
+- “Unsure” if uncertain.
+
+4. Generate Response:
+- Format your response as JSON:
+{
+  \'chosen_option\': \'Your choice\',
+  \'reasoning\': \'Your reasoning\'
+}",
+  
+  few_shot = "Your goal is to deduce in which UK's Local Authroity District (LAD) the entity (a toponym) in question is situated. Instructions:
+
+1. Look at the entity provided and read the article carefully to understand the context.
+2. Check Metadata: the publisher’s domain is provided as it may provide geographic context.
+3. Determine which Local Authority District should be associated to the entity. 
+4. Format response as JSON: { 'chosen_option': 'Your choice', 'reasoning': 'Your reasoning' }"
+  )
+
+classification_questions <- list(
+  cq_normal = "Which of the options provided best represents the Local Authority District (LAD) for the entity provided, based on the context in the article? Ensure the response is strictly in JSON format with no additional text, explanations, or commentary outside of the JSON object. Match the JSON schema indicated. Example of output: {\'chosen_option\': \'Fife\', \'reasoning\': \'The article refers to a toponym situated in Fife.\'}",
+  cq_few_shot = "Which UK Local Authority District (LAD) is the entity in question situated in? Alternative answers:
+- “Entity is not a location”.
+- “Entity is a location outside the UK”.
+- “Entity spans across several districts (e.g., a region)“ for entities that are not specific to a single LAD (e.g., Wales, Sussex)
+- “Unsure”.
+
+Example 1: 
+Entity: King's Head pub.
+Article: Incident outside the King's Head pub on Main Street, Guildford.
+Domain: guildforddragon.co.uk.
+Output: {\'chosen_option\': \'Guildford\', \'reasoning\': \'The article mentions Main Street, Guildford.\'}. 
+
+Example 2:
+Entity: Dublin.
+Article: Dublin has experienced a lot of rain lately.
+Domain: belfasttelegraph.co.uk.
+Output: {\'chosen_option\': \'Entity is a location outside the UK\', \'reasoning\': \'Dublin is located in Ireland, not in the UK.\'}.
+
+Ensure the response is strictly in JSON format with no additional text, explanations, or commentary outside of the JSON object. Match the JSON schema indicated."
+)
+
+# Define valid combinations of prompts, experiments, and classification questions
+valid_combinations <- list(
+  concise = list(experiments = c("exp1", "exp2", "exp3", "exp4"), question = "cq_normal"),
+  full = list(experiments = c("exp1", "exp2", 
+                              "exp3", "exp4"), question = "cq_normal"),
+  few_shot = list(experiments = c("exp4"), question = "cq_few_shot")
+)
+```
+
+```{r experiment_function}
+query_llm <- function(data, system_message, classification_question, included_fields = c("Outlet coverage LAD", "Domain", "Other Entities")) {
+  # Create prompts for each row
+  prompts <- data %>%
+    rowwise() %>%
+    mutate(
+      test_prompt = glue(
+        "{system_message}\n",
+        "Entity: {machine_entities_array}\n\n",
+        "Article: {doc}\n\n",
+        if ("Outlet coverage LAD" %in% included_fields) {
+          "Outlet coverage LAD: {`Outlet coverage LAD`}\n"
+        } else {
+          ""
+        },
+        if ("Domain" %in% included_fields) {
+          "Domain: {domain}\n"
+        } else {
+          ""
+        },
+        if ("Other Entities" %in% included_fields) {
+          "Other Entities: {other_entities_and_candidates}\n\n"
+        } else {
+          ""
+        },
+        "Options: {options_str}\n",
+        "{classification_question}"
+      )
+    ) %>%
+    pull(test_prompt)
+  
+  # Create httr2_request objects for each prompt
+  reqs <- map2(prompts, data$model, function(prompt, model) {
+    httr2::request("http://localhost:11434") %>%
+      httr2::req_url_path("/api/generate") %>%
+      httr2::req_headers("Content-Type" = "application/json") %>%
+      httr2::req_body_json(list(
+        model = model,  # Use model for this specific request
+        prompt = prompt,
+        stream = FALSE,
+        format = "json",
+        keep_alive = "10s",
+        options = list(seed = 42, temperature = data$temperature[data$model == model][1])  # Use temperature associated with the model
+      ))
+  })
+  
+  # Make parallel requests
+  resps <- httr2::req_perform_parallel(reqs, on_error = "continue", progress = TRUE)
+  
+  # Process the responses
+  results <- map(resps, function(resp) {
+    resp_body <- httr2::resp_body_json(resp)
+    return(resp_body$response)  # Use $ to access response directly
+  })
+  
+  # Add results to the original data
+  data$api_result <- results
+  
+  return(data)
+}
+
+```
+
+```{r run_experiments}
+# Define the combined function
+parse_annotations <- function(df) {
+  # Step 1: Extract JSON content
+processed_result <- df %>%
+    mutate(api_result = str_extract(api_result, "\\{[\\s\\S]*\\}")) 
+  
+  # Step 2: Parse the extracted JSON
+processed_result <- processed_result %>% # some are NA - how do I get around this? 
+    mutate(api_result = map(api_result, ~ possibly(fromJSON, NULL)(.x))) # possibly(fromJSON, NULL) to handle NA values
+  
+  # Step 3: Extract specific values into new columns with if_else
+processed_result <- processed_result %>%
+    mutate(
+      chosen_option = map_chr(api_result, ~ if (!is.null(.x) && !is.null(.x$chosen_option)) .x$chosen_option else NA_character_),
+      reasoning = map_chr(api_result, ~ coalesce(
+        if (!is.null(.x) && !is.null(.x$reasoning)) .x$reasoning else NULL,
+        if (!is.null(.x) && !is.null(.x$explanation)) .x$explanation else NULL,
+        NA_character_
+      ))
+    )
+
+  return(processed_result)
+}
+
+
+# Iterate through prompts
+for (prompt_name in names(valid_combinations)) {
+  prompt_config <- valid_combinations[[prompt_name]]
+  system_message <- prompts[[prompt_name]]  # Get the system message
+  
+  # Get the classification question for this prompt
+  classification_question <- classification_questions[[prompt_config$question]]
+  
+  # Iterate through experiments valid for this prompt
+  for (exp_name in prompt_config$experiments) {
+    included_fields <- experiments[[exp_name]]  # Get fields for the current experiment
+    
+    # Run the query_llm function (adjust to your actual data and function)
+    result <- query_llm(
+      data = data_expanded,  # Adjust to your dataset
+      system_message = system_message,
+      classification_question = classification_question,
+      included_fields = included_fields
+    )
+    
+    result <- parse_annotations(result)
+    
+    # Directly save results to disk after processing
+    write_csv(result, file = paste0("llm_annotation_experiments/results_", exp_name, "_", prompt_name, "_", Sys.Date(), ".csv"))
+    
+    # Optionally, you could also print progress to track the process
+    cat("Processed:", exp_name, "with prompt:", prompt_name, "\n")
+  }
+}
+
+# Could also be run parallelised although no major benefit was found:
+# library(future)
+# library(future.apply)
+# library(tibble)
+# 
+# # Define the function for processing a single experiment-prompt combination
+# process_experiment <- function(prompt_name, exp_name) {
+#   prompt_config <- valid_combinations[[prompt_name]]
+#   system_message <- prompts[[prompt_name]]
+#   
+#   classification_question <- classification_questions[[prompt_config$question]]
+#   included_fields <- experiments[[exp_name]]
+#   
+#   # Run the query_llm function
+#   result <- query_llm(
+#     data = data_expanded,
+#     system_message = system_message,
+#     classification_question = classification_question,
+#     included_fields = included_fields
+#   )
+#   
+#   result <- parse_annotations(result)
+#   
+#   # Save results to disk
+#   output_file <- paste0("llm_annotation_experiments/results_", exp_name, "_", prompt_name, "_", Sys.Date(), ".csv")
+#   write_csv(result, file = output_file)
+#   
+#   # Return a log message
+#   return(tibble(Prompt = prompt_name, Experiment = exp_name, File = output_file))
+# }
+# 
+# tasks <- do.call(c, lapply(names(valid_combinations), function(prompt_name) {
+#   prompt_config <- valid_combinations[[prompt_name]]
+#   lapply(prompt_config$experiments, function(exp_name) {
+#     list(prompt_name = prompt_name, exp_name = exp_name)
+#   })
+# }))
+# 
+# # Set up a parallel backend
+# plan(multisession)  # Adjust to your machine (e.g., multicore or cluster)
+# 
+# # Run tasks in parallel
+# results_log <- future_lapply(tasks, function(task) {
+#   process_experiment(task$prompt_name, task$exp_name)
+# })
+```
+
+```{r adding_one_model}
+# Define models and temperatures to test
+models <- c("qwen2:7b-instruct")
+temperatures <- seq(0, 1, by = 0.25)
+argList <- list(model = models, temperature = temperatures)
+crossArg <- cross_df(argList)
+data_expanded2 <- full_join(crossArg, llm_data, by = character())
+
+# Iterate through prompts
+for (prompt_name in names(valid_combinations)) {
+  prompt_config <- valid_combinations[[prompt_name]]
+  system_message <- prompts[[prompt_name]]  # Get the system message
+  
+  # Get the classification question for this prompt
+  classification_question <- classification_questions[[prompt_config$question]]
+  
+  # Iterate through experiments valid for this prompt
+  for (exp_name in prompt_config$experiments) {
+    included_fields <- experiments[[exp_name]]  # Get fields for the current experiment
+    
+    # Run the query_llm function (adjust to your actual data and function)
+    result <- query_llm(
+      data = data_expanded2,  # Adjust to your dataset
+      system_message = system_message,
+      classification_question = classification_question,
+      included_fields = included_fields
+    )
+    
+    result <- parse_annotations(result)
+    
+    # Directly save results to disk after processing
+    write_csv(result, file = paste0("llm_annotation_experiments/results_", exp_name, "_", prompt_name, "_qwen7b", ".csv"))
+    
+    # Optionally, you could also print progress to track the process
+    cat("Processed:", exp_name, "with prompt:", prompt_name, "\n")
+  }
+}
+```
+
+## Running zero shot classification on cases where gazetteer lacked examples
+
+```{r}
+# remove redundant entities 23/01
+gold_data <- read_csv("../../Prompt_LLM_Paper/gold_data.csv")
+gold_data_single <- gold_data |> select(doc, text, domain, main_LAD, annotators_choice, recoded_choice) |> distinct()
+
+no_candidates <- anti_join(gold_data_single, llm_data, by = c("text" = "machine_entities_array", "domain", "doc"))
+
+# Define models and temperatures to test
+models <- c("mistral", "gemma2:latest", "llama3.1:latest", "qwen2:7b-instruct")
+temperatures <- seq(0, 1, by = 0.25)
+argList <- list(model = models, temperature = temperatures)
+crossArg <- cross_df(argList)
+data_expanded <- full_join(crossArg, no_candidates, by = character())
+
+few_shot_prompt <- prompts$few_shot
+classification_question <- classification_questions$cq_few_shot
+
+# Define the query function (adjusted for simplified case)
+query_llm <- function(data, system_message, classification_question) {
+  # Create prompts for each row
+  prompts <- data %>%
+    rowwise() %>%
+    mutate(
+      test_prompt = glue(
+        "{system_message}\n",
+        "Entity: {text}\n\n",
+        "Article: {doc}\n\n",
+        "Domain: {domain}\n\n",  # Directly include Domain
+        "{classification_question}"
+      )
+    ) %>%
+    pull(test_prompt)
+  
+  # Create httr2_request objects for each prompt
+  reqs <- map2(prompts, data$model, function(prompt, model) {
+    httr2::request("http://localhost:11434") %>%
+      httr2::req_url_path("/api/generate") %>%
+      httr2::req_headers("Content-Type" = "application/json") %>%
+      httr2::req_body_json(list(
+        model = model,  # Use model for this specific request
+        prompt = prompt,
+        stream = FALSE,
+        format = "json",
+        keep_alive = "10s",
+        options = list(seed = 42, temperature = data$temperature[data$model == model][1])  # Use temperature associated with the model
+      ))
+  })
+  
+  # Make parallel requests
+  resps <- httr2::req_perform_parallel(reqs, on_error = "continue", progress = TRUE)
+  
+  # Process the responses
+  results <- map(resps, function(resp) {
+    resp_body <- httr2::resp_body_json(resp)
+    return(resp_body$response)  # Use $ to access response directly
+  })
+  
+  # Add results to the original data
+  data$api_result <- results
+  
+  return(data)
+}
+
+
+# Run the query function
+result <- query_llm(
+    data = data_expanded,  
+    system_message = few_shot_prompt,
+    classification_question = classification_question
+  )
+  
+# Process the results
+result <- parse_annotations(result)
+  
+# Save results to disk
+write_csv(result, file = paste0("llm_annotation_experiments/results_few_shot_no_candidates_", Sys.Date(), ".csv"))
+```
+
+## Evaluation
+
+```{r evaluation_functions}
+non_LAD_answer <- c(
+  "Unsure",
+  "Entity is not a location",
+  "Entity is a location outside the UK",
+  "LAD not in options",
+  "Entity spans across several districts (e.g., a region)",
+  "Entity spans multiple districts (e.g., a region)",
+  "Entity is outside the UK"
+)
+
+# Function to evaluate model's performance
+evaluate_model <- function(data, replacement_table) {
+  data %>%
+    rename(model_candidate = chosen_option) %>%
+    mutate(
+      model_candidate = replace_na(model_candidate, "Unsure"),
+      model_candidate = str_replace_all(model_candidate, "([.\\^$*+?()|{}\\[\\]])", "\\\\\\1"),
+      model_candidate = case_when(
+        model_candidate == "Armagh City" ~ "Armagh City, Banbridge and Craigavon",
+        model_candidate == "Bristol" ~ "Bristol, City of",
+        model_candidate == "Herefordshire" ~ "Herefordshire, County of",
+        model_candidate == "Edinburgh" ~ "City of Edinburgh",
+        model_candidate == "Newry Mourne and Down" ~ "Newry, Mourne and Down",
+        model_candidate == "Kingston upon Hull" ~ "Kingston upon Hull, City of",
+        model_candidate == "Wokingham Borough" ~ "Wokingham",
+        model_candidate == "Brighton" ~ "Brighton and Hove",
+        model_candidate == "Mid Sussex District Council" ~ "Mid Sussex",
+        model_candidate == "Oldham Metropolitan Borough Council" ~ "Oldham",
+        model_candidate == "" ~ "Unsure",
+        TRUE ~ model_candidate # Retain original value for unmatched cases
+      ),
+      model_candidate = gsub("\\\\", "", model_candidate)) |> 
+    rowwise() |> 
+    mutate(model_candidate = if_else(
+        model_candidate %in% replacement_table$original_name,
+        replacement_table$official_name[match(model_candidate, replacement_table$original_name)],
+        model_candidate # Retain original value for unmatched cases
+      )
+    ) %>%
+    ungroup() |> 
+    mutate(result = case_when(
+        # True Positive: Model and annotator agree on an LAD (sometimes the model shortens the LAD name)
+        (
+          annotators_choice == model_candidate |
+            str_detect(annotators_choice, fixed(model_candidate))
+        ) & !annotators_choice %in% non_LAD_answer ~ "True Positive",
+        
+        annotators_choice == model_candidate &
+          annotators_choice %in% non_LAD_answer ~ "True Negative",
+        
+        # False Negative: Model and annotator disagree on an LAD
+        annotators_choice != model_candidate &
+          !annotators_choice %in% non_LAD_answer &
+          model_candidate %in% non_LAD_answer ~ "False Negative",
+        
+        annotators_choice != model_candidate &
+          annotators_choice %in% non_LAD_answer &
+          model_candidate %in% non_LAD_answer ~ "True Negative",
+        # no false answer is given
+        
+        # False Positive: Model and annotator disagree on a non-LAD
+        annotators_choice != model_candidate &
+          annotators_choice %in% non_LAD_answer &
+          !model_candidate %in% non_LAD_answer ~ "False Positive",
+        
+        annotators_choice != model_candidate &
+          !annotators_choice %in% non_LAD_answer &
+          !model_candidate %in% non_LAD_answer ~ "False Positive",
+        
+        # Fallback for anything uncategorised
+        TRUE ~ "Uncategorised"
+      ),
+      True_Positive = if_else(result == "True Positive", 1, 0),
+      False_Positive = if_else(result == "False Positive", 1, 0),
+      True_Negative = if_else(result == "True Negative", 1, 0),
+      False_Negative = if_else(result == "False Negative", 1, 0)
+    )
+}
+
+
+```
+
+# Re-Evaluation upon Removal of Entities across Districts, non-UK locations, and non-locations
+
+```{r evaluation}
+# Load the results, experiment_number set from the filename
+results <- list.files("llm_annotation_experiments/full_experiments", full.names = TRUE) |> 
+  map_dfr(~ read_csv(.x) |> 
+            mutate(experiment_number = tools::file_path_sans_ext(basename(.x))))
+
+results <- results |> 
+  mutate(annotators_choice = if_else(machine_entities_array == "East Anglia", "Entity spans across several districts (e.g., a region)", annotators_choice))
+
+results_filtered <- results |> 
+  inner_join(gold_data_single, by = c("machine_entities_array" = "text",
+                                      "doc",
+                               #"Outlet coverage LAD" = "main_LAD",
+                               "annotators_choice"))
+
+no_cand_results <- read_csv("llm_annotation_experiments/results_few_shot_no_candidates_2025-01-23.csv")  |>
+            mutate(experiment_number = "results_few_shot_no_candidates")
+
+# Rename columns in both datasets for consistency
+no_cand_results_renamed <- no_cand_results %>%
+  rename(machine_entities_array = text,`Outlet coverage LAD`= main_LAD)
+
+# Identify common columns
+common_columns <- intersect(colnames(results_filtered), colnames(no_cand_results_renamed))
+
+# Bind rows keeping only common columns
+combined_results <- bind_rows(
+  select(results_filtered, all_of(common_columns)),
+  select(no_cand_results_renamed, all_of(common_columns))
+)
+
+remove_from_no_cand <- combined_results |> group_by(doc, machine_entities_array) |> count() |> filter(n > 180) |> inner_join(llm_data) |>
+  filter(!str_detect(entity_candidate_pair, "\\[]"))
+
+no_cand_results_renamed_clean <- no_cand_results_renamed %>%
+  anti_join(remove_from_no_cand, by = c("doc", "machine_entities_array", "annotators_choice"))
+
+no_cand_results_renamed_clean <- no_cand_results_renamed_clean |> 
+  mutate(
+    recoded_choice = if_else(
+      recoded_choice == "Derry and Strabane",
+      "Derry City and Strabane",
+      recoded_choice
+    )) 
+
+
+# # overwrite 
+# combined_results <- bind_rows(
+#   select(results_filtered, all_of(common_columns)),
+#   select(no_cand_results_renamed_clean, all_of(common_columns))
+# )
+# 
+# district_names <- read_sheet("https://docs.google.com/spreadsheets/d/1Y1xGVuFqMzaKnbQAQFgaIdgVJ1Ciik3UV5ougUzxXXE/edit?gid=2113306442#gid=2113306442", sheet = "Districts") |> select(LAD) |> rename(chosen_option = LAD)
+# 
+# model_options <- combined_results |> select(chosen_option) |> distinct() |> anti_join(district_names) |> anti_join(as_tibble(non_LAD_answer), by = c("chosen_option" = "value")) # I manually created the alternate names for this in google sheet
+# 
+replacement_table <- read_sheet("https://docs.google.com/spreadsheets/d/1Y1xGVuFqMzaKnbQAQFgaIdgVJ1Ciik3UV5ougUzxXXE/edit?gid=2113306442#gid=2113306442", sheet = "Alternative Names") # Adjust the path as needed
+
+evaluated_multi <- results_filtered |>
+  mutate(
+    annotators_choice = if_else(
+      annotators_choice == "Armagh City",
+      "Armagh City, Banbridge and Craigavon",
+      annotators_choice
+    )) 
+
+evaluated_multi <- evaluate_model(evaluated_multi, replacement_table)|> 
+  mutate(experiment_number = str_remove(experiment_number, "(?!.*_).*"))
+
+# Evaluation function for zero shot is different
+evaluate_zero_shot <- function(data, replacement_table) {
+  data %>%
+    rename(model_candidate = chosen_option) %>%
+    mutate(
+      model_candidate = replace_na(model_candidate, "Unsure"),
+      model_candidate = str_replace_all(model_candidate, "([.\\^$*+?()|{}\\[\\]])", "\\\\\\1"),
+      model_candidate = case_when(
+        model_candidate == "Armagh City" ~ "Armagh City, Banbridge and Craigavon",
+        model_candidate == "Bristol" ~ "Bristol, City of",
+        model_candidate == "Herefordshire" ~ "Herefordshire, County of",
+        model_candidate == "Edinburgh" ~ "City of Edinburgh",
+        model_candidate == "Newry Mourne and Down" ~ "Newry, Mourne and Down",
+        model_candidate == "Kingston upon Hull" ~ "Kingston upon Hull, City of",
+        model_candidate == "Wokingham Borough" ~ "Wokingham",
+        model_candidate == "Brighton" ~ "Brighton and Hove",
+        model_candidate == "Mid Sussex District Council" ~ "Mid Sussex",
+        model_candidate == "Oldham Metropolitan Borough Council" ~ "Oldham",
+        model_candidate == "" ~ "Unsure",
+        TRUE ~ model_candidate # Retain original value for unmatched cases
+      ),
+      model_candidate = gsub("\\\\", "", model_candidate)) |> 
+    rowwise() |> 
+    mutate(model_candidate = if_else(
+        model_candidate %in% replacement_table$original_name,
+        replacement_table$official_name[match(model_candidate, replacement_table$original_name)],
+        model_candidate # Retain original value for unmatched cases
+      )
+    ) %>%
+    ungroup() |> 
+    mutate(result = case_when(
+        # True Positive: Model and annotator agree on an LAD (sometimes the model shortens the LAD name)
+        (
+          recoded_choice == model_candidate |
+            str_detect(recoded_choice, fixed(model_candidate))
+        ) & !recoded_choice %in% non_LAD_answer ~ "True Positive",
+        
+        recoded_choice == model_candidate &
+          recoded_choice %in% non_LAD_answer ~ "True Negative",
+        
+        # False Negative: Model and annotator disagree on an LAD
+        recoded_choice != model_candidate &
+          !recoded_choice %in% non_LAD_answer &
+          model_candidate %in% non_LAD_answer ~ "False Negative",
+        
+        recoded_choice != model_candidate &
+          recoded_choice %in% non_LAD_answer &
+          model_candidate %in% non_LAD_answer ~ "True Negative",
+        # no false answer is given
+        
+        # False Positive: Model and annotator disagree on a non-LAD
+        recoded_choice != model_candidate &
+          recoded_choice %in% non_LAD_answer &
+          !model_candidate %in% non_LAD_answer ~ "False Positive",
+        
+        recoded_choice != model_candidate &
+          !recoded_choice %in% non_LAD_answer &
+          !model_candidate %in% non_LAD_answer ~ "False Positive",
+        
+        # Fallback for anything uncategorised
+        TRUE ~ "Uncategorised"
+      ),
+      True_Positive = if_else(result == "True Positive", 1, 0),
+      False_Positive = if_else(result == "False Positive", 1, 0),
+      True_Negative = if_else(result == "True Negative", 1, 0),
+      False_Negative = if_else(result == "False Negative", 1, 0)
+    )
+}
+
+evaluated_zero_shot <- evaluate_zero_shot(no_cand_results_renamed_clean, replacement_table) |> 
+  mutate(experiment_number = str_remove(experiment_number, "(?!.*_).*"))
+
+# Summarize metrics for exp_multi_results
+metrics_exp_multi <- evaluated_multi %>%
+  group_by(experiment_number, model, temperature) %>%
+  summarize(
+    True_Positive = sum(True_Positive),
+    False_Positive = sum(False_Positive),
+    True_Negative = sum(True_Negative),
+    False_Negative = sum(False_Negative),
+    Total = n()
+  )
+
+# Summarize metrics for exp2_results
+metrics_exp_no_cand <- evaluated_zero_shot %>%
+  group_by(model, temperature) %>%
+  summarize(
+    True_Positive = sum(True_Positive),
+    False_Positive = sum(False_Positive),
+    True_Negative = sum(True_Negative),
+    False_Negative = sum(False_Negative),
+    Total = n()
+  )
+
+# Merge the summaries from both experiments based on model and temperature
+combined_metrics <- metrics_exp_multi %>%
+  left_join(metrics_exp_no_cand, by = c("model", "temperature"), suffix = c("_exp_multi", "_exp_no_cand")) %>%
+  mutate(
+    # Combine the True_Positive, False_Positive, True_Negative, False_Negative, and Total counts
+    True_Positive = True_Positive_exp_multi + True_Positive_exp_no_cand,
+    False_Positive = False_Positive_exp_multi + False_Positive_exp_no_cand,
+    True_Negative = True_Negative_exp_multi + True_Negative_exp_no_cand,
+    False_Negative = False_Negative_exp_multi + False_Negative_exp_no_cand,
+    Total = Total_exp_multi + Total_exp_no_cand,
+    # Calculate metrics after summing the results
+    Precision = True_Positive / (True_Positive + False_Positive),
+    Recall = True_Positive / (True_Positive + False_Negative),
+    F1_Score = 2 * Precision * Recall / (Precision + Recall),
+    Accuracy = (True_Positive + True_Negative) / Total
+  )
+
+combined_metrics |> arrange(desc(Accuracy)) |> head(10) |> print()
+
+ggplot(combined_metrics, aes(x = Precision, y = Recall, color = experiment_number)) +
+  facet_wrap(~model, nrow = 1) +
+  geom_point(size = 2, alpha= 0.7) +
+  theme_minimal() + theme(legend.position = "none")
+
+renamed_combined_metrics <- combined_metrics |> 
+  mutate(
+    # Remove the "results_" prefix and trailing underscores for processing
+    experiment_number = str_remove(experiment_number, "results_"),
+    
+    # Define the experiment type based on the first part of the number
+    experiment_type = case_when(
+      str_detect(experiment_number, "exp1") ~ "All Metadata",
+      str_detect(experiment_number, "exp2") ~ "No Outlet LAD",
+      str_detect(experiment_number, "exp3") ~ "No Domain",
+      str_detect(experiment_number, "exp4") ~ "Only Domain"
+    ),
+    
+    # Define the format based on the second part of the number
+    prompt = case_when(
+      str_detect(experiment_number, "concise") ~ "Concise",
+      str_detect(experiment_number, "full") ~ "Full",
+      str_detect(experiment_number, "few_shot") ~ "Few Shot"
+    )
+  )
+
+p <- renamed_combined_metrics |> 
+  group_by(experiment_type, prompt) |> 
+  summarise(mean = mean(F1_Score)) |> 
+ggplot(aes(x = experiment_type, y = mean, color = prompt)) +
+  geom_point(size = 3, alpha = 0.7) +  # Mean points
+  theme_minimal() + 
+  scale_y_continuous(limits = c(0.7,0.9))+
+  labs(y = "Mean F1 Score", x = "") +
+  theme(legend.position = "bottom")
+
+p <- renamed_combined_metrics |> 
+  mutate(model = str_remove(model, ":.*")) |> 
+   mutate(
+    model = factor(model, levels = c("gemma2", "llama3.1", "qwen2", "mistral")),  # Specify model order
+    prompt = factor(prompt, levels = c("Full", "Concise", "Few Shot"))  # Specify prompt order
+  ) |> 
+  ggplot(aes(x = prompt, y = F1_Score, color = experiment_type)) +
+  facet_wrap(~model, nrow = 1) +
+  geom_jitter(size = 1, alpha = 0.7, width = 0.15) +
+  theme_minimal() + 
+  theme(
+    legend.position = "right",  # Place legend at the bottom
+    legend.margin = margin(l = -10),  # Decrease space around the legend
+    legend.spacing.y = unit(0.3, "cm")  # Further reduce vertical space between legend items
+  ) +  labs(y = "F1 Score", x = "", color = NULL) +  # Remove legend name
+  scale_x_discrete(labels = c("Full" = "Full", "Concise" = "Concise", "Few Shot" = "Few\nShot"))
+
+ggplot2::ggsave(
+  "results_llms.pdf", p,
+  width = 18,
+  height = 5,
+  dpi = 600,
+  units = "cm"
+)
+
+```
+
+### Voting Majority System
+
+#### Recoding true lad for LAD not in options.
+
+This won't affect how many coordinates I will be able to assign, but it can give me a sense of how often the model gets it right despite not following instructions and answering the correct LAD instead of LAD not in options
+
+```{r}
+best_models <- combined_metrics |> group_by(model) |> filter(experiment_number == "results_exp4_full_") |> arrange(desc(F1_Score)) |> slice_head(n = 1) |> filter(model != "mistral")
+
+# Eval with at least two models agreeing
+eval_true_lad_recoded <- 
+  evaluated_multi |>
+  ungroup() |> 
+  inner_join(best_models, by = c("model", "temperature", "experiment_number")) |> 
+  filter(model != "mistral") |> 
+  group_by(doc, machine_entities_array, annotators_choice, recoded_choice) |>
+  reframe(
+    # Count occurrences of each model's candidate for this group
+    option_counts = table(model_candidate), 
+    chosen_option = names(sort(option_counts, decreasing = TRUE)[1]),
+    count_chosen = max(option_counts)
+  ) |>
+  select(-option_counts) |> 
+  distinct()
+
+evaluated_multi_basic <- eval_true_lad_recoded |> 
+  rename(model_candidate = chosen_option) %>%
+    mutate(result = case_when(
+        recoded_choice == model_candidate ~ "True",
+        recoded_choice != model_candidate  ~ "False",
+        TRUE ~ "Uncategorised"
+      ),
+      result = if_else(model_candidate == "LAD not in options" & annotators_choice == "LAD not in options", "True", result),
+      True = if_else(result == "True", 1, 0),
+      False = if_else(result == "False", 1, 0),
+    )
+
+# Evaluation function for zero shot is different
+evaluate_zero_shot_basic <- function(data, replacement_table) {
+  data %>%
+    rename(model_candidate = chosen_option) %>%
+    mutate(
+      model_candidate = replace_na(model_candidate, "Unsure"),
+      model_candidate = str_replace_all(model_candidate, "([.\\^$*+?()|{}\\[\\]])", "\\\\\\1"),
+      model_candidate = case_when(
+        model_candidate == "Armagh City" ~ "Armagh City, Banbridge and Craigavon",
+        model_candidate == "Bristol" ~ "Bristol, City of",
+        model_candidate == "Herefordshire" ~ "Herefordshire, County of",
+        model_candidate == "Edinburgh" ~ "City of Edinburgh",
+        model_candidate == "Newry Mourne and Down" ~ "Newry, Mourne and Down",
+        model_candidate == "Kingston upon Hull" ~ "Kingston upon Hull, City of",
+        model_candidate == "Wokingham Borough" ~ "Wokingham",
+        model_candidate == "Brighton" ~ "Brighton and Hove",
+        model_candidate == "Mid Sussex District Council" ~ "Mid Sussex",
+        model_candidate == "Oldham Metropolitan Borough Council" ~ "Oldham",
+        model_candidate == "" ~ "Unsure",
+        TRUE ~ model_candidate # Retain original value for unmatched cases
+      ),
+      model_candidate = gsub("\\\\", "", model_candidate)) |> 
+    rowwise() |> 
+    mutate(model_candidate = if_else(
+        model_candidate %in% replacement_table$original_name,
+        replacement_table$official_name[match(model_candidate, replacement_table$original_name)],
+        model_candidate # Retain original value for unmatched cases
+      )
+    ) %>%
+    ungroup() |> 
+    mutate(result = case_when(
+        recoded_choice == model_candidate ~ "True",
+        recoded_choice != model_candidate  ~ "False",
+        TRUE ~ "Uncategorised"
+      ),
+    result = if_else(model_candidate == "LAD not in options" & annotators_choice == "LAD not in options", "True", result),
+      True = if_else(result == "True", 1, 0),
+      False = if_else(result == "False", 1, 0),
+    )
+}
+
+evaluated_zero_shot_basic <- evaluated_zero_shot |> 
+  inner_join(best_models, by = c("model", "temperature")) |> 
+  filter(model != "mistral") |> 
+  group_by(doc, machine_entities_array, recoded_choice, annotators_choice) |>
+  reframe(
+    # Count occurrences of each model's candidate for this group
+    option_counts = table(model_candidate), 
+    chosen_option = names(sort(option_counts, decreasing = TRUE)[1]),
+    count_chosen = max(option_counts),
+    # Check if 'gemma2' is among the models for this group
+    gemma2_option = if ("gemma2:latest" %in% names(option_counts)) "gemma2:latest" else NA_character_,
+    gemma2_candidate = if (!is.na(gemma2_option)) gemma2_option else chosen_option
+  ) |> 
+  mutate(
+    # Override chosen_option with gemma2_candidate when count_chosen == 1
+    chosen_option = if_else(count_chosen == 1 & !is.na(gemma2_option), gemma2_candidate, chosen_option)
+  ) |>
+  select(-option_counts, -gemma2_option, -gemma2_candidate) |> 
+  distinct()
+
+evaluated_zero_shot_basic <- evaluate_zero_shot_basic(evaluated_zero_shot_basic, replacement_table)
+
+# Identify common columns
+common_columns <- intersect(colnames(evaluated_zero_shot_basic), colnames(evaluated_multi_basic))
+
+# Bind rows keeping only common columns
+t3 <- bind_rows(
+  select(evaluated_multi_basic, all_of(common_columns)),
+  select(evaluated_zero_shot_basic, all_of(common_columns))
+) 
+
+t3 |> group_by(count_chosen) |> summarise(perc = n()/nrow(t3))
+# 1	0.09257266			
+# 2	0.23896663			
+# 3	0.66846071	
+
+voting_recoded_metrics <- t3 |> 
+  summarize(
+    Description = "Pick most voted option and we forgive the model for answering correct despite right option not provided",
+    True = sum(True),
+    Total = n(),
+    Accuracy = True / Total
+  )
+```
+
+```{r}
+# Calculate metrics for count_chosen == 3
+metrics_count_unanimous <- t3 |> 
+  filter(count_chosen == 3) |> 
+  summarize(
+    Description = "Metrics for cases where count_chosen == 3",
+    True = sum(True),
+    Total = n(),
+    Perc = Total/nrow(t3),
+    Accuracy = True / Total
+  )
+
+# Calculate metrics for count_chosen == 2
+metrics_count_filtered_majority <- t3 |> 
+  filter(count_chosen >= 2) |> 
+  summarize(
+    Description = "Metrics for cases where count_chosen >= 2",
+    True = sum(True),
+    Total = n(),
+    Perc = Total/nrow(t3),
+    Accuracy = True / Total
+  )
+
+# Combine the metrics for comparison
+metrics_combined <- bind_rows(voting_recoded_metrics, metrics_count_unanimous, metrics_count_filtered_majority)
+
+# Print the combined metrics
+print(metrics_combined)
+
+```
+
+```{r}
+# expand results to account for multi toponym in articles
+t3_expanded <- t3 |> 
+  left_join(gold_data, by = c("doc", "machine_entities_array" = "text"))
+
+voting_recoded_metrics <- t3_expanded |> 
+  summarize(
+    Description = "Pick most voted option and we forgive the model for answering correct despite right option not provided",
+    True = sum(True),
+    Total = n(),
+    Accuracy = True / Total
+  )
+
+metrics_count_unanimous <- t3_expanded |> 
+  filter(count_chosen == 3) |> 
+  summarize(
+    Description = "Metrics for cases where count_chosen == 3",
+    True = sum(True),
+    Total = n(),
+    Perc = Total/nrow(t3_expanded),
+    Accuracy = True / Total
+  )
+
+# Calculate metrics for count_chosen == 2
+metrics_count_filtered_majority <- t3_expanded |> 
+  filter(count_chosen >= 2) |> 
+  summarize(
+    Description = "Metrics for cases where count_chosen >= 2",
+    True = sum(True),
+    Total = n(),
+    Perc = Total/nrow(t3_expanded),
+    Accuracy = True / Total
+  )
+
+# Combine the metrics for comparison
+metrics_combined <- bind_rows(voting_recoded_metrics, metrics_count_unanimous, metrics_count_filtered_majority)
+
+# Print the combined metrics
+print(metrics_combined)
+```
+
+```{r}
+# export results
+write_csv(t3_expanded, "prompt_results.csv")
+```

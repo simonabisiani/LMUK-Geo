@@ -1,0 +1,168 @@
+\section{Human Coding Instructions}\label{appendix:human_coding}
+
+This appendix provides the annotation guidelines used for the Toponym Disambiguation stage of the gold dataset. Annotators were instructed to classify toponyms (locations) mentioned in articles by selecting the correct Local Authority District (LAD) from a list, using the following detailed steps. Annotators were instructed to complete this process for each document and location entity pair.\newline
+
+\begin{quote}
+    "\textbf{Annotation Guide for Location Classification Task}\newline
+The objective of this task is to classify toponyms (locations) mentioned in articles by selecting the correct Local Authority District (LAD) from a list. Annotators will examine the context in which each location appears to determine the best match.\newline
+
+\textbf{Task Overview}\newline
+You will be presented with a location entity (a toponym) and the article it is mentioned in.
+Based on the context, choose the most appropriate Local Authority District (LAD) from the options provided.\newline
+
+\textbf{Steps to Complete the Task}\newline
+1. Review the Article
+Read the document carefully to understand the context of the entity (location) provided.\newline
+Example:
+Document: ""An incident took place outside the King's Head pub on Main Street, Guildford.""
+Location Entity: King's Head\newline
+Understand the Context\newline
+Focus on the surrounding text to infer the location’s real-world reference.
+Example: In the above text, the context (Main Street, Guildford) helps you pinpoint the exact location of King's Head.\newline
+2. Review Metadata\newline
+Check the metadata for additional clues:
+Main LAD: The principal Local Authority District for the article.
+Domain: The news outlet’s domain may offer regional context.
+Example:\newline
+Main LAD: Newark and Sherwood\newline
+Domain: newarkadvertiser.co.uk\newline
+3. Select the Correct LAD\newline
+Choose the most appropriate LAD based on the context and the provided options.
+Options include:\newline
+If you identify the correct LAD, select it from the list.\newline
+If no LAD is relevant, choose “LAD not in options.”\newline
+If the entity is wrongly identified (e.g., it refers to a person), select “Entity is not a location.”\newline
+For locations outside the UK, choose “Entity is a location outside the UK.”\newline
+If uncertain, select “Unsure.”\newline
+
+\textbf{Quality Control}\newline
+Context is Key: Avoid assumptions—rely on the document to guide your choice.
+Consistency: Ensure your decisions are consistent throughout the document.
+Revisiting Decisions: If a new piece of information in the document changes your earlier classification, feel free to update the previous annotation.
+Complete this process for each document and location entity pair, ensuring accuracy and careful review for every selection."
+\end{quote}
+
+\section{Prompts}\label{appendix:prompts_classification}
+This appendix provides an overview of the prompt types and classification questions used for mapping toponyms to Local Authority Districts (LADs). Each prompt and question is defined with its detailed instructions.
+
+\subsection{Concise Prompt}
+\begin{quote}
+    "Map the entity (a toponym) to the correct Local Authority District (LAD) from the options. Instructions:
+1. Review Entity and Article context.
+2. Check Metadata where provided:
+- Outlet coverage LAD, Domain, and other Entities and candidates (for hints on location).
+3. Choose the best option:
+- Select a LAD from the list provided, or choose from “LAD not in options,” “Entity is not a location,” “Entity is outside the UK,” “Entity spans multiple districts,” or “Unsure.”
+Format response as JSON: \{chosen\_option: Your choice, reasoning: 'Your reasoning'\}
+
+Entity: \{machine\_entities\_array\},
+Article: \{doc\},
+Metadata: if ("Outlet coverage LAD" \%in\% included\_fields) \{
+          Outlet coverage LAD: \{`Outlet coverage LAD`\}
+        \} else \{
+          ""
+        \},
+        if ("Domain" \%in\% included\_fields) \{
+          Domain: \{domain\}
+        \} else \{
+          ""
+        \},
+        if ("Other Entities" \%in\% included\_fields) \{
+          Other Entities: \{other\_entities\_and\_candidates\}
+        \} else \{
+          ""
+        \},
+Options: \{options\_str\}
+
+Which of the options provided best represents the Local Authority District (LAD) for the entity provided, based on the context in the article? Ensure the response is strictly in JSON format with no additional text, explanations, or commentary outside of the JSON object. Match the JSON schema indicated. Example of output: {chosen\_option: Fife, reasoning: The article refers to a toponym situated in Fife.}"
+\end{quote}
+
+\subsection{Full Prompt}
+\begin{quote}
+    "The task is mapping an entity (a toponym) to the Local Authority District (LAD) in which it is situated. Your goal is to select the correct option from the list provided. Instructions:
+1. Review Entity and Article:
+- Identify the toponym (location name).
+- Read the article carefully to understand the context.
+Example:
+Entity: King's Head pub.
+Article: Incident outside the King's Head pub on Main Street, Guildford.
+Use surrounding text to infer the location (e.g., Guildford).
+
+2. Check Metadata where provided:
+- Domain: The publisher’s domain may provide geographic context.
+- Outlet coverage LAD: The Local Authority District covered by the outlet which published the article.
+- Other Entities: Other entities present in the same articles and their candidates.
+
+3. Select answer from options:
+Choose the correct answer from the options based on context.
+Options:
+- A list of applicable Districts, if any.
+- “LAD not in options” (choose if correct District is missing).
+- “Entity is not a location” if applicable.
+- “Entity is outside the UK” for non-UK locations.
+- “Entity spans across several districts (e.g., a region)“ for entities that are not specific to a single LAD (e.g., Wales, Sussex).
+- “Unsure” if uncertain.
+
+4. Generate Response:
+- Format your response as JSON:
+\{
+  \'chosen\_option\': \'Your choice\',
+  \'reasoning\': \'Your reasoning\'
+\}
+
+Entity: \{machine\_entities\_array\},
+Article: \{doc\},
+Metadata: if ("Outlet coverage LAD" \%in\% included\_fields) \{
+          Outlet coverage LAD: \{`Outlet coverage LAD`\}
+        \} else \{
+          ""
+        \},
+        if ("Domain" \%in\% included\_fields) \{
+          Domain: \{domain\}
+        \} else \{
+          ""
+        \},
+        if ("Other Entities" \%in\% included\_fields) \{
+          Other Entities: \{other\_entities\_and\_candidates\}
+        \} else \{
+          ""
+        \},
+Options: \{options\_str\}
+
+Which of the options provided best represents the Local Authority District (LAD) for the entity provided, based on the context in the article? Ensure the response is strictly in JSON format with no additional text, explanations, or commentary outside of the JSON object. Match the JSON schema indicated. Example of output: {chosen\_option: Fife, reasoning: The article refers to a toponym situated in Fife.}"
+\end{quote}
+
+\subsection{Few-shot prompt}
+\begin{quote}
+    "Your goal is to deduce in which UK's Local Authroity District (LAD) the entity (a toponym) in question is situated. Instructions:
+
+1. Look at the entity provided and read the article carefully to understand the context.
+2. Check Metadata: the publisher’s domain is provided as it may provide geographic context.
+3. Determine which Local Authority District should be associated to the entity. 
+4. Format response as JSON: {chosen\_option: Your choice, reasoning: Your reasoning}
+
+Entity: {machine\_entities\_array},
+Article: {doc},
+Metadata: Domain: {domain},
+Options: {options\_str}
+
+Which UK Local Authority District (LAD) is the entity in question situated in? Alternative answers:
+- “Entity is not a location”.
+- “Entity is a location outside the UK”.
+- “Entity spans across several districts (e.g., a region)“ for entities that are not specific to a single LAD (e.g., Wales, Sussex)
+- “Unsure”.
+
+Example 1: 
+Entity: King's Head pub.
+Article: Incident outside the King's Head pub on Main Street, Guildford.
+Domain: guildforddragon.co.uk.
+Output: {chosen\_option: Guildford, reasoning: The article mentions Main Street, Guildford.}. 
+
+Example 2:
+Entity: Dublin.
+Article: Dublin has experienced a lot of rain lately.
+Domain: belfasttelegraph.co.uk.
+Output: {chosen\_option: Entity is a location outside the UK, reasoning: Dublin is located in Ireland, not in the UK.}.
+
+Ensure the response is strictly in JSON format with no additional text, explanations, or commentary outside of the JSON object. Match the JSON schema indicated."
+\end{quote}

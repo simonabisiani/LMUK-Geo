@@ -1,0 +1,4 @@
+model,temperature
+gemma2:latest,0
+llama3.1:latest,0.5
+qwen2:7b-instruct,0.25

@@ -1,0 +1,420 @@
+---
+title: "Comparison of Prompt and Fine Tuned"
+author: "Simona Bisiani"
+format: html
+editor: visual
+---
+
+```{r}
+library(jsonlite)
+library(tidyverse)
+```
+
+```{r}
+# Load the data
+files <- list.files(path = "../../UK_Local_News_Toponym_Resolution/entities", full.names = TRUE)
+
+gold_files <- files[grepl("gold_data_new", files)]
+gold_json <- lapply(gold_files, fromJSON)
+
+# Process the JSON data to create an unnested data frame
+data <- fromJSON(gold_files[1], simplifyDataFrame = FALSE)
+
+# Process the JSON data
+unnested_df <- data %>%
+  enframe(name = "article_id", value = "entries") %>%
+  unnest_longer(entries) %>%
+  unnest_wider(entries) %>%
+  pivot_longer(cols = c(LOC, FAC, GPE), names_to = "entity_type", values_to = "entity") %>%
+  filter(!is.na(entity)) |> select(-c(type, geonamesID)) |> 
+  mutate(gold_lat = as.numeric(Latitude),
+         gold_lon = as.numeric(Longitude),
+         gold_lat = if_else(is.na(gold_lat), as.numeric(substr(Latitude, 1, 7)), gold_lat),
+         Latitude = gold_lat, Longitude = gold_lon)
+
+# Get Local Authority District for each coordinate
+lad_shapefile <-
+  sf::read_sf("../data/geo_data/LAD_MAY_2024_UK_BFE.shp")
+
+library(geosphere)   # For geodesic distance calculation
+library(sf)
+library(maps)
+
+assign_LAD_to_candidates <-
+  function(candidates, lad_shapefile) {
+    # Convert candidates to sf object with the correct CRS
+    candidates_coords <- candidates |>
+      select(Longitude, Latitude) |>
+      distinct() |>
+      st_as_sf(
+        coords = c("Longitude", "Latitude"),
+        crs = 4326,
+        remove = FALSE
+      ) |>
+      st_transform(crs = st_crs(lad_shapefile))
+    
+    # Perform spatial join to find the corresponding LAD
+    points_to_LAD <-
+      st_join(candidates_coords, lad_shapefile, left = TRUE)
+    
+    # Add LAD to original data and identify missing LADs
+    candidates_lads <-
+      candidates |>
+      left_join(points_to_LAD, by = c("Longitude", "Latitude"))
+    
+    return(candidates_lads)
+  }
+
+unnested_df <- assign_LAD_to_candidates(unnested_df, lad_shapefile) |> select(c(1:9, LAD24NM))
+```
+
+### Fine Tuned
+
+```{r}
+# Process the JSON data to create an unnested data frame
+data2 <- fromJSON(gold_files[2], simplifyDataFrame = FALSE)
+
+# Process the second dataset
+unnested_df2 <- data2 %>%
+  enframe(name = "article_id", value = "entries") %>%
+  unnest_longer(entries) %>%
+  unnest_wider(entries) %>%
+  # Rename 'LOC' to 'entity' to align with the first dataset
+  rename(entity = LOC) |> 
+  mutate(Latitude = lat, Longitude = lon)
+
+# Bind
+fine_tuned_results <- full_join(unnested_df |> select(-Latitude, -Longitude), unnested_df2, by = c("article_id", "entity", "start", "end"))
+
+fine_tuned_results_with_lads <-
+  assign_LAD_to_candidates(fine_tuned_results, lad_shapefile) |> 
+  mutate(result = if_else(LAD24NM.x == LAD24NM.y, "TRUE", "FALSE"))
+  
+fine_tuned_results_with_lads <- 
+  assign_LAD_to_candidates(fine_tuned_results, lad_shapefile) |> 
+  mutate(result = LAD24NM.x == LAD24NM.y)
+
+# Function to calculate distances between actual and predicted coordinates
+calculate_distances <- function(data) {
+  # Earth's maximum error distance in kilometers
+  MAX_ERROR <- 20039
+  
+  # Compute the Haversine distance for each row
+  data <- data %>%
+    rowwise() %>%
+    mutate(
+      distance = ifelse(
+        !is.na(gold_lat) & !is.na(lat) & !is.na(gold_lon) & !is.na(lon),
+        distHaversine(c(gold_lon, gold_lat), c(lon, lat)) / 1000,
+        MAX_ERROR
+      )
+    )
+  
+  return(data)
+}
+
+# Evaluation function
+evaluate_predictions <- function(data) {
+  # Calculate distances
+  data <- calculate_distances(data)
+  
+  # Metrics
+  accuracy_at_20 <- mean(data$distance <= 20, na.rm = TRUE)
+  accuracy_at_161 <- mean(data$distance <= 161, na.rm = TRUE)
+  mean_error_distance <- mean(data$distance, na.rm = TRUE)
+  accuracy_classification <- sum(data$result, na.rm = TRUE) / nrow(data)
+  
+  # Results
+  metrics <- list(
+    Accuracy_20km = accuracy_at_20,
+    Accuracy_161km = accuracy_at_161,
+    Mean_Error_Distance = mean_error_distance,
+    Accuracy_Classification = accuracy_classification
+  )
+  
+  return(metrics)
+}
+
+ft_distances <- calculate_distances(fine_tuned_results_with_lads)
+ft_metrics <- evaluate_predictions(fine_tuned_results_with_lads)
+```
+
+# Prompt-based Max error defaulting
+
+```{r}
+prompt_results <- read_csv("prompt_results.csv")
+candidates_gold_data <- read_csv("../../Prompt_LLM_Paper/2_candidate_selection/candidates_of_gold_data.csv") |> 
+  select(c(text, POSTCODE_DISTRICT, os, osm, LAD24NM, LAT, LONG)) |> distinct()
+
+set.seed(123)
+prompts_results_with_coordinates <- prompt_results |> 
+  left_join(candidates_gold_data, by = c("machine_entities_array"= "text", "model_candidate" = "LAD24NM")) |> 
+  group_by(start, end, machine_entities_array, doc) |> 
+  slice_sample(n = 1) |> 
+  select(doc, start, end, machine_entities_array, model_candidate, count_chosen, result, domain,LAT,LONG, os,osm) |> 
+  rename(lat = LAT, lon = LONG, entity = machine_entities_array)
+
+prompt_results <- full_join(unnested_df, prompts_results_with_coordinates, by = c("entity", "start", "end"))  |>
+  mutate(result = if_else(result == "TRUE", TRUE, FALSE)) |> 
+  mutate(result = if_else(
+    model_candidate == "LAD not in options" & 
+    LAD24NM != "LAD not in options" & 
+    result == TRUE,
+    FALSE,
+    result
+  ))
+
+prompt_results_filtered <- full_join(unnested_df, prompts_results_with_coordinates, by = c("entity", "start", "end")) |> 
+  filter(model_candidate != "LAD not in options") |>
+  mutate(result = if_else(result == "TRUE", TRUE, FALSE))
+
+prompts_unanimous <- full_join(unnested_df, prompts_results_with_coordinates, by = c("entity", "start", "end")) |> 
+  filter(count_chosen > 2) |>
+  mutate(result = if_else(result == "TRUE", TRUE, FALSE))
+
+prompts_maj <- full_join(unnested_df, prompts_results_with_coordinates, by = c("entity", "start", "end")) |> filter(count_chosen > 1) |>
+  mutate(result = if_else(result == "TRUE", TRUE, FALSE))
+
+pt_distances <- calculate_distances(prompt_results)
+pt_metrics <- evaluate_predictions(prompt_results)
+
+pt_filt_distances <- calculate_distances(prompt_results_filtered)
+pt_filt_metrics <- evaluate_predictions(prompt_results_filtered)
+
+pt_un_distances <- calculate_distances(prompts_unanimous)
+pt_un_metrics <- evaluate_predictions(prompts_unanimous)
+
+pt_maj_distances <- calculate_distances(prompts_maj)
+pt_maj_metrics <- evaluate_predictions(prompts_maj)
+
+results <- bind_rows(as_tibble(pt_metrics), as_tibble(pt_filt_metrics), as_tibble(pt_un_metrics), as_tibble(pt_maj_metrics), .id = "approach") |> 
+  mutate(approach = case_when(approach == 1 ~  "prompt-based",
+                              approach == 2 ~ "filtered",
+                              approach == 3 ~ "un",
+                              TRUE ~ "maj"))
+```
+
+# Prompt-based Centroid Coordinates
+
+```{r}
+districs <- read_sheet("https://docs.google.com/spreadsheets/d/1Y1xGVuFqMzaKnbQAQFgaIdgVJ1Ciik3UV5ougUzxXXE/edit?gid=2113306442#gid=2113306442", sheet = "Districts") |> select(LAD, Latitude, Longitude) |> rename(lad_lat = Latitude, lad_lon = Longitude)
+
+prompts_results2 <- prompt_results |> 
+  left_join(districs, by = c("model_candidate"="LAD")) |> 
+  mutate(lat = if_else(is.na(lat), lad_lat, lat),
+         lon = if_else(is.na(lon), lad_lon, lon))
+
+prompt_results_filtered <- full_join(unnested_df, prompts_results_with_coordinates, by = c("entity", "start", "end")) |> 
+  left_join(districs, by = c("model_candidate"="LAD")) |> 
+  filter(model_candidate != "LAD not in options") |>
+  mutate(lat = if_else(is.na(lat), lad_lat, lat),
+         lon = if_else(is.na(lon), lad_lon, lon)) |> 
+  mutate(result = if_else(result == "TRUE", TRUE, FALSE))
+
+prompts_unanimous <- full_join(unnested_df, prompts_results_with_coordinates, by = c("entity", "start", "end")) |> 
+  filter(count_chosen > 2)  |> 
+  left_join(districs, by = c("model_candidate"="LAD")) |> 
+  mutate(lat = if_else(is.na(lat), lad_lat, lat),
+         lon = if_else(is.na(lon), lad_lon, lon)) |> 
+  mutate(result = if_else(result == "TRUE", TRUE, FALSE))
+
+prompts_maj <- full_join(unnested_df, prompts_results_with_coordinates, by = c("entity", "start", "end")) |> 
+  filter(count_chosen > 1)  |> 
+  left_join(districs, by = c("model_candidate"="LAD")) |> 
+  mutate(lat = if_else(is.na(lat), lad_lat, lat),
+         lon = if_else(is.na(lon), lad_lon, lon)) |> 
+  mutate(result = if_else(result == "TRUE", TRUE, FALSE))
+
+pt_distances2 <- calculate_distances(prompts_results2)
+pt_metrics2 <- evaluate_predictions(prompts_results2)
+
+pt_filt_distances2 <- calculate_distances(prompt_results_filtered)
+pt_filt_metrics2 <- evaluate_predictions(prompt_results_filtered)
+
+pt_un_distances2 <- calculate_distances(prompts_unanimous)
+pt_un_metrics2 <- evaluate_predictions(prompts_unanimous)
+
+pt_maj_distances2 <- calculate_distances(prompts_maj)
+pt_maj_metrics2 <- evaluate_predictions(prompts_maj)
+
+results2 <- bind_rows(as_tibble(pt_metrics2), as_tibble(pt_filt_metrics2), as_tibble(pt_un_metrics2), as_tibble(pt_maj_metrics2), .id = "approach") |> 
+  mutate(approach = case_when(approach == 1 ~  "prompt-based",
+                              approach == 2 ~ "filtered",
+                              approach == 3 ~ "un",
+                              TRUE ~ "maj"))
+```
+
+
+```{r}
+# Step 1: Read Data
+prompt_results <- read_csv("prompt_results.csv")
+candidates_gold_data <- read_csv("../../Prompt_LLM_Paper/2_candidate_selection/candidates_of_gold_data.csv") |> 
+  select(c(text, POSTCODE_DISTRICT, os, osm, LAD24NM, LAT, LONG)) |> distinct()
+
+districs <- read_sheet("https://docs.google.com/spreadsheets/d/1Y1xGVuFqMzaKnbQAQFgaIdgVJ1Ciik3UV5ougUzxXXE/edit?gid=2113306442#gid=2113306442", sheet = "Districts") |> 
+  select(LAD, Latitude, Longitude) |> rename(lad_lat = Latitude, lad_lon = Longitude)
+
+set.seed(123)
+prompt_results <- prompt_results |>
+  left_join(
+    candidates_gold_data,
+    by = c(
+      "machine_entities_array" = "text",
+      "model_candidate" = "LAD24NM"
+    )
+  ) |>
+  group_by(start, end, machine_entities_array, doc) |>
+  slice_sample(n = 1) |>
+  select(
+    doc,
+    start,
+    end,
+    machine_entities_array,
+    model_candidate,
+    count_chosen,
+    result,
+    domain,
+    LAT,
+    LONG,
+    os,
+    osm,
+    annotators_choice.x
+  ) |>
+  rename(lat = LAT, lon = LONG, entity = machine_entities_array, annotators_choice = annotators_choice.x) %>%
+  left_join(districs, by = c("model_candidate" = "LAD")) |>
+  full_join(unnested_df, by = c("entity", "start", "end")) %>%
+  mutate(
+    result = if_else(result == "TRUE", TRUE, FALSE),
+    result2 = if_else(
+      model_candidate == "LAD not in options" &
+        LAD24NM != "LAD not in options" &
+        result == TRUE,
+      FALSE,
+      result
+    )
+  ) |> 
+  relocate(LAD24NM, model_candidate, annotators_choice, result, result2)
+
+
+# Step 3: Calculate Distances Function
+calculate_distances <- function(data) {
+  MAX_ERROR <- 20039
+  
+  data <- data %>%
+    rowwise() %>%
+    mutate(
+      distance = ifelse(
+        !is.na(gold_lat) & !is.na(lat) & !is.na(gold_lon) & !is.na(lon),
+        distHaversine(c(gold_lon, gold_lat), c(lon, lat)) / 1000,
+        MAX_ERROR
+      )
+    )
+  
+  return(data)
+}
+
+# Step 1: Define functions for metric calculations
+evaluate_predictions <- function(data, approach_name) {
+  # Calculate distances
+  data <- calculate_distances(data)
+  
+  # Accuracy calculations (rounded to 2 decimals)
+  accuracy_at_20 <- round(mean(data$distance <= 20), 2)
+  accuracy_at_161 <- round(mean(data$distance <= 161), 2)
+  mean_error_distance <- round(mean(data$distance), 2)
+  task_acc <- round(sum(data$result == TRUE) / nrow(data), 2)
+  system_acc <- round(sum(data$result2 == TRUE) / nrow(data), 2)
+  
+  # Metrics with the current approach name
+  metrics <- list(
+    Accuracy_20km = accuracy_at_20,
+    Accuracy_161km = accuracy_at_161,
+    Mean_Error_Distance = mean_error_distance,
+    system_acc = system_acc,
+    task_acc = task_acc,
+    approach = approach_name  # Keep the approach name for proper labelling
+  )
+  
+  return(metrics)
+}
+
+
+# Original dataset (unchanged)
+baseline <- prompt_results
+
+# Filtered dataset: model_candidate != "LAD not in options"
+filtered <- prompt_results %>% 
+  filter(model_candidate != "LAD not in options")
+
+# Filtered dataset: count_chosen > 2
+majority <- prompt_results %>%
+  filter(count_chosen > 1)
+
+# Filtered dataset: count_chosen > 1
+unanimous <- prompt_results %>%
+  filter(count_chosen > 2)
+
+
+prepare_data <- function(data, approach_name) {
+  if (approach_name == "max_error") {
+    # For max_error approach, return data without modification
+    return(data)
+  } else {
+    # For "centroid" approach, update missing lat/lon with centroid values
+    data <- data %>%
+      mutate(lat = if_else(is.na(lat), lad_lat, lat),
+             lon = if_else(is.na(lon), lad_lon, lon))
+    return(data)
+  }
+}
+
+
+variants <- list(
+  prompt_based_centroid = list(data = baseline, approach_name = "centroid", prompt_type = "prompt_based"),
+  filtered_centroid = list(data = filtered, approach_name = "centroid", prompt_type = "filtered"),
+  unanimous_centroid = list(data = unanimous, approach_name = "centroid", prompt_type = "unanimous"),
+  majority_centroid = list(data = majority, approach_name = "centroid", prompt_type = "majority"),
+  
+  prompt_based_max_error = list(data = baseline, approach_name = "max_error", prompt_type = "prompt_based"),
+  filtered_max_error = list(data = filtered, approach_name = "max_error", prompt_type = "filtered"),
+  unanimous_max_error = list(data = unanimous, approach_name = "max_error", prompt_type = "unanimous"),
+  majority_max_error = list(data = majority, approach_name = "max_error", prompt_type = "majority")
+)
+
+results_ <- map_dfr(variants, function(variant) {
+  # Prepare the data with the specified approach
+  prepared_data <- prepare_data(variant$data, variant$approach_name)
+  
+  # Calculate the metrics
+  metrics <- evaluate_predictions(prepared_data, variant$approach_name)
+  
+  # Return metrics with the correct approach name and prompt type
+  tibble(
+    approach = metrics$approach, 
+    Accuracy_20km = metrics$Accuracy_20km, 
+    Accuracy_161km = metrics$Accuracy_161km, 
+    Mean_Error_Distance = metrics$Mean_Error_Distance, 
+    system_acc = metrics$system_acc, 
+    task_acc = metrics$task_acc, 
+    prompt_type = variant$prompt_type  # Include prompt_type in the results
+  )
+})
+
+nrow(filtered)/nrow(baseline)
+nrow(unanimous)/nrow(baseline)
+nrow(majority)/nrow(baseline)
+
+# View the results
+results_ |> relocate(prompt_type) |> arrange(prompt_type)
+```
+
+
+
+# Check a subset
+
+```{r}
+ft_false <- ft_distances |>
+  filter(result == FALSE) |> 
+  left_join(pt_distances, by = c("article_id", "start", "end", "entity", "entity_type", "gold_lat", "gold_lon")) |> 
+  filter(result.y == TRUE)
+```
