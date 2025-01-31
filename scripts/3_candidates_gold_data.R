@@ -200,7 +200,7 @@ candidates_gold_data |>
 #   rows_update(is_na, by = c("Latitude", "Longitude", "values"))
 
 # write_csv(candidates_gold_data_with_lads, "toponym_candidates_with_lads_gold_data.csv")
-candidates_gold_data_with_lads <- read_csv("Library/CloudStorage/OneDrive-UniversityofSurrey/Documents/Prompt_LLM_Paper/2_candidate_selection/toponym_candidates_with_lads_gold_data.csv")
+candidates_gold_data_with_lads <- read_csv("toponym_candidates_with_lads_gold_data.csv")
 
 ################################################################################
 # PLOTS

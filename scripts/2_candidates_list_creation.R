@@ -9,17 +9,17 @@ library(tidyverse)
 
 # Load the three dataframes: OS and OSM generated candidates, and entities list
 osm <-
-  read_csv("users/sb02767/processed_geocode_results_including_missing_postcode_entities.csv") |>
+  read_csv("processed_geocode_results_including_missing_postcode_entities.csv") |>
   mutate(osm = "OSM") |>
   rename(value = Entity) |> 
   mutate(POSTCODE_DISTRICT = if_else(POSTCODE_DISTRICT == "None", NA_character_, POSTCODE_DISTRICT))
 
 os <-
-  read_csv("users/sb02767/os_gazetteer_lookup_match.csv") |>
+  read_csv("os_gazetteer_lookup_match.csv") |>
   select(-c(`...1`, NAME1, entity)) |>
   mutate(os = "OS") |> mutate(value = str_to_lower(value))
 
-ents2 <- read_csv("/parallel_scratch/sb02767/unique_entities.csv")
+ents2 <- read_csv("unique_entities.csv")
 
 # MERGE THE THREE
 ents_merged <-
@@ -65,4 +65,4 @@ os_osm_ <-
 os_osm_2 <- os_osm_ |> 
   filter_at(vars(POSTCODE_DISTRICT, Latitude, Longitude), any_vars(!is.na(.)))
 
-write_csv(os_osm_2, "/parallel_scratch/sb02767/os_osm_candidates.csv") 
+write_csv(os_osm_2, "os_osm_candidates.csv") 

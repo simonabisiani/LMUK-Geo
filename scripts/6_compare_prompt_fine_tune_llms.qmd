@@ -12,7 +12,7 @@ library(tidyverse)
 
 ```{r}
 # Load the data
-files <- list.files(path = "../../UK_Local_News_Toponym_Resolution/entities", full.names = TRUE)
+files <- list.files(path = "files", full.names = TRUE)
 
 gold_files <- files[grepl("gold_data_new", files)]
 gold_json <- lapply(gold_files, fromJSON)
@@ -34,7 +34,7 @@ unnested_df <- data %>%
 
 # Get Local Authority District for each coordinate
 lad_shapefile <-
-  sf::read_sf("../data/geo_data/LAD_MAY_2024_UK_BFE.shp")
+  sf::read_sf("geo_data/LAD_MAY_2024_UK_BFE.shp")
 
 library(geosphere)   # For geodesic distance calculation
 library(sf)
@@ -139,116 +139,12 @@ ft_distances <- calculate_distances(fine_tuned_results_with_lads)
 ft_metrics <- evaluate_predictions(fine_tuned_results_with_lads)
 ```
 
-# Prompt-based Max error defaulting
-
-```{r}
-prompt_results <- read_csv("prompt_results.csv")
-candidates_gold_data <- read_csv("../../Prompt_LLM_Paper/2_candidate_selection/candidates_of_gold_data.csv") |> 
-  select(c(text, POSTCODE_DISTRICT, os, osm, LAD24NM, LAT, LONG)) |> distinct()
-
-set.seed(123)
-prompts_results_with_coordinates <- prompt_results |> 
-  left_join(candidates_gold_data, by = c("machine_entities_array"= "text", "model_candidate" = "LAD24NM")) |> 
-  group_by(start, end, machine_entities_array, doc) |> 
-  slice_sample(n = 1) |> 
-  select(doc, start, end, machine_entities_array, model_candidate, count_chosen, result, domain,LAT,LONG, os,osm) |> 
-  rename(lat = LAT, lon = LONG, entity = machine_entities_array)
-
-prompt_results <- full_join(unnested_df, prompts_results_with_coordinates, by = c("entity", "start", "end"))  |>
-  mutate(result = if_else(result == "TRUE", TRUE, FALSE)) |> 
-  mutate(result = if_else(
-    model_candidate == "LAD not in options" & 
-    LAD24NM != "LAD not in options" & 
-    result == TRUE,
-    FALSE,
-    result
-  ))
-
-prompt_results_filtered <- full_join(unnested_df, prompts_results_with_coordinates, by = c("entity", "start", "end")) |> 
-  filter(model_candidate != "LAD not in options") |>
-  mutate(result = if_else(result == "TRUE", TRUE, FALSE))
-
-prompts_unanimous <- full_join(unnested_df, prompts_results_with_coordinates, by = c("entity", "start", "end")) |> 
-  filter(count_chosen > 2) |>
-  mutate(result = if_else(result == "TRUE", TRUE, FALSE))
-
-prompts_maj <- full_join(unnested_df, prompts_results_with_coordinates, by = c("entity", "start", "end")) |> filter(count_chosen > 1) |>
-  mutate(result = if_else(result == "TRUE", TRUE, FALSE))
-
-pt_distances <- calculate_distances(prompt_results)
-pt_metrics <- evaluate_predictions(prompt_results)
-
-pt_filt_distances <- calculate_distances(prompt_results_filtered)
-pt_filt_metrics <- evaluate_predictions(prompt_results_filtered)
-
-pt_un_distances <- calculate_distances(prompts_unanimous)
-pt_un_metrics <- evaluate_predictions(prompts_unanimous)
-
-pt_maj_distances <- calculate_distances(prompts_maj)
-pt_maj_metrics <- evaluate_predictions(prompts_maj)
-
-results <- bind_rows(as_tibble(pt_metrics), as_tibble(pt_filt_metrics), as_tibble(pt_un_metrics), as_tibble(pt_maj_metrics), .id = "approach") |> 
-  mutate(approach = case_when(approach == 1 ~  "prompt-based",
-                              approach == 2 ~ "filtered",
-                              approach == 3 ~ "un",
-                              TRUE ~ "maj"))
-```
-
-# Prompt-based Centroid Coordinates
-
-```{r}
-districs <- read_sheet("https://docs.google.com/spreadsheets/d/1Y1xGVuFqMzaKnbQAQFgaIdgVJ1Ciik3UV5ougUzxXXE/edit?gid=2113306442#gid=2113306442", sheet = "Districts") |> select(LAD, Latitude, Longitude) |> rename(lad_lat = Latitude, lad_lon = Longitude)
-
-prompts_results2 <- prompt_results |> 
-  left_join(districs, by = c("model_candidate"="LAD")) |> 
-  mutate(lat = if_else(is.na(lat), lad_lat, lat),
-         lon = if_else(is.na(lon), lad_lon, lon))
-
-prompt_results_filtered <- full_join(unnested_df, prompts_results_with_coordinates, by = c("entity", "start", "end")) |> 
-  left_join(districs, by = c("model_candidate"="LAD")) |> 
-  filter(model_candidate != "LAD not in options") |>
-  mutate(lat = if_else(is.na(lat), lad_lat, lat),
-         lon = if_else(is.na(lon), lad_lon, lon)) |> 
-  mutate(result = if_else(result == "TRUE", TRUE, FALSE))
-
-prompts_unanimous <- full_join(unnested_df, prompts_results_with_coordinates, by = c("entity", "start", "end")) |> 
-  filter(count_chosen > 2)  |> 
-  left_join(districs, by = c("model_candidate"="LAD")) |> 
-  mutate(lat = if_else(is.na(lat), lad_lat, lat),
-         lon = if_else(is.na(lon), lad_lon, lon)) |> 
-  mutate(result = if_else(result == "TRUE", TRUE, FALSE))
-
-prompts_maj <- full_join(unnested_df, prompts_results_with_coordinates, by = c("entity", "start", "end")) |> 
-  filter(count_chosen > 1)  |> 
-  left_join(districs, by = c("model_candidate"="LAD")) |> 
-  mutate(lat = if_else(is.na(lat), lad_lat, lat),
-         lon = if_else(is.na(lon), lad_lon, lon)) |> 
-  mutate(result = if_else(result == "TRUE", TRUE, FALSE))
-
-pt_distances2 <- calculate_distances(prompts_results2)
-pt_metrics2 <- evaluate_predictions(prompts_results2)
-
-pt_filt_distances2 <- calculate_distances(prompt_results_filtered)
-pt_filt_metrics2 <- evaluate_predictions(prompt_results_filtered)
-
-pt_un_distances2 <- calculate_distances(prompts_unanimous)
-pt_un_metrics2 <- evaluate_predictions(prompts_unanimous)
-
-pt_maj_distances2 <- calculate_distances(prompts_maj)
-pt_maj_metrics2 <- evaluate_predictions(prompts_maj)
-
-results2 <- bind_rows(as_tibble(pt_metrics2), as_tibble(pt_filt_metrics2), as_tibble(pt_un_metrics2), as_tibble(pt_maj_metrics2), .id = "approach") |> 
-  mutate(approach = case_when(approach == 1 ~  "prompt-based",
-                              approach == 2 ~ "filtered",
-                              approach == 3 ~ "un",
-                              TRUE ~ "maj"))
-```
-
+### Prompt-Based
 
 ```{r}
 # Step 1: Read Data
 prompt_results <- read_csv("prompt_results.csv")
-candidates_gold_data <- read_csv("../../Prompt_LLM_Paper/2_candidate_selection/candidates_of_gold_data.csv") |> 
+candidates_gold_data <- read_csv("candidates_of_gold_data.csv") |> 
   select(c(text, POSTCODE_DISTRICT, os, osm, LAD24NM, LAT, LONG)) |> distinct()
 
 districs <- read_sheet("https://docs.google.com/spreadsheets/d/1Y1xGVuFqMzaKnbQAQFgaIdgVJ1Ciik3UV5ougUzxXXE/edit?gid=2113306442#gid=2113306442", sheet = "Districts") |> 
@@ -408,13 +304,3 @@ nrow(majority)/nrow(baseline)
 results_ |> relocate(prompt_type) |> arrange(prompt_type)
 ```
 
-
-
-# Check a subset
-
-```{r}
-ft_false <- ft_distances |>
-  filter(result == FALSE) |> 
-  left_join(pt_distances, by = c("article_id", "start", "end", "entity", "entity_type", "gold_lat", "gold_lon")) |> 
-  filter(result.y == TRUE)
-```

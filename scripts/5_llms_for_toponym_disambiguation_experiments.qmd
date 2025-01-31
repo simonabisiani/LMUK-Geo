@@ -57,9 +57,9 @@ library(glue)
 #############################################################################
 # random sample
 annotations =
-  read_csv('../temp/NED_annotations/annotators_disambiguated_data.csv')
+  read_csv('annotators_disambiguated_data.csv')
 
-annotations_further_data <- read_csv("../temp/NED_annotations/annotators_data.csv") |> filter(!is.na(LAD24NM)) |> group_by(doc, machine_entities_array) |>
+annotations_further_data <- read_csv("annotators_data.csv") |> filter(!is.na(LAD24NM)) |> group_by(doc, machine_entities_array) |>
   mutate(full_option = paste0(
     if_else(!is.na(machine_entities_array), machine_entities_array, ""),
     if_else(!is.na(LAD24NM), paste0(", ", LAD24NM), ""),
@@ -74,7 +74,7 @@ annotations_further_data <- read_csv("../temp/NED_annotations/annotators_data.cs
   select(doc, machine_entities_array, full_option)
 
 annotations_options =
-  fromJSON("../temp/NED_annotations/updated_merged_data.json") |>
+  fromJSON("updated_merged_data.json") |>
   as.data.frame() |>
   unnest() |>
   select(-domain) |>
@@ -113,8 +113,8 @@ annotations_options =
 
 # after creating the manual dataset, I had gone and removed some noise entities from the toponym candidates (these included Irish entities, names of foreign cities, Irish regions, country names)
 # all_possible_candidates <- read_csv("../temp/toponym_candidates_with_lads.csv")
-to_remove <- read_csv("../temp/entities_to_remove.csv")
-annotators_data_no_org <- read_csv("../temp/NED_annotations/annotators_data_no_org.csv") |> pull(machine_entities_array) |> unique()
+to_remove <- read_csv("entities_to_remove.csv")
+annotators_data_no_org <- read_csv("annotators_data_no_org.csv") |> pull(machine_entities_array) |> unique()
 
 data <- annotations_options |> select(-full_option) |> distinct() |>
   mutate(entity = str_to_lower(machine_entities_array)) |>
@@ -142,7 +142,7 @@ second_batch <-
   ) |>
   select(group_id, annotators_choice, options_str, entity)
 
-metadata_second_batch <- read_csv("../new_100_article_sample_w_candidates_for_google.csv") |>
+metadata_second_batch <- read_csv("new_100_article_sample_w_candidates_for_google.csv") |>
   left_join(second_batch, by = c("group_id", "entity")) |>
   rename(machine_entities_array = entity,
          `Outlet coverage LAD` = main_LAD) |> select(-options) |> 
@@ -473,7 +473,7 @@ for (prompt_name in names(valid_combinations)) {
 
 ```{r}
 # remove redundant entities 23/01
-gold_data <- read_csv("../../Prompt_LLM_Paper/gold_data.csv")
+gold_data <- read_csv("gold_data.csv")
 gold_data_single <- gold_data |> select(doc, text, domain, main_LAD, annotators_choice, recoded_choice) |> distinct()
 
 no_candidates <- anti_join(gold_data_single, llm_data, by = c("text" = "machine_entities_array", "domain", "doc"))

@@ -121,14 +121,13 @@ long <- new_100_article_sample_entities %>%
   unnest_wider(entities) %>% 
   mutate(entity_lower = str_to_lower(entity))
 
-to_remove <- read_csv("../../users/sb02767/entities_to_remove.csv")
+to_remove <- read_csv("entities_to_remove.csv")
 
 long_filtered <- long %>% 
   anti_join(to_remove, by = c("entity_lower" = "value"))
 
-googlesheets4::gs4_deauth()
 second_batch <-
-  read_sheet(ss = "https://docs.google.com/spreadsheets/d/1Y1xGVuFqMzaKnbQAQFgaIdgVJ1Ciik3UV5ougUzxXXE/edit?gid=1707858191#gid=1707858191", sheet = "Additional Data to Disambiguate") |>
+  read_csv("Additional Data to Disambiguate.csv") |>
   mutate(
     annotators_choice = if_else(
       Agreement == FALSE,
@@ -387,7 +386,7 @@ lapply(split(gold_data_fixed, gold_data_fixed$article_id_group), function(subset
 
 ######
 # File for Harvard Dataverse
-off <- read_csv("../../LMUK-Geo.csv")
+off <- read_csv("LMUK-Geo.csv")
 off <- off |> left_join(publishers) |> 
   rename(publisher = Owner)
 
@@ -425,4 +424,4 @@ result <- lapply(1:nrow(off), function(i) {
 
 # Convert to JSON
 json_result <- toJSON(result, pretty = TRUE)
-write(json_result, "../../LMUK-Geo.json")
+write(json_result, "LMUK-Geo.json")
