@@ -27,6 +27,13 @@ Our approach utilises open-source LLMs (Gemma2, Llama3.1, Qwen2, Mistral) via th
 
 We evaluated our approach using both classification metrics (Accuracy) and distance metrics (Mean Error Distance, Accuracy@20km, Accuracy@161km). We compared our results against a baseline provided by [Hu et al, 2024](https://www-tandfonline-com.surrey.idm.oclc.org/doi/full/10.1080/13658816.2024.2405182?af=R).  We considered different evaluation scenarios, including handling edge cases and using majority voting.
 
+## Repository Structure
+
+The repository is organised as follows:
+
+* `scripts/`: Contains the R scripts used for creating the dataset, geoparsing, analysis, and evaluation.
+* `files/`: Contains the data files used in the project, including (but not limited to) raw data, intermediate processed data, and output files.  
+
 ## Citation
 
 If you use this dataset or code in your research, please cite the following:
